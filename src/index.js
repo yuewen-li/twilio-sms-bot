@@ -47,6 +47,58 @@ function isAllowedFromNumber(fromNumber, allowedList) {
   return allowedList.some((n) => normalizePhoneNumber(n) === fromNorm);
 }
 
+// Conversation history helpers
+async function getConversationHistory(kv, phoneNumber, maxHistory = 10) {
+  try {
+    const history = await kv.get(phoneNumber, { type: "json" });
+    return Array.isArray(history) ? history.slice(-maxHistory) : [];
+  } catch (error) {
+    console.error("Error retrieving conversation history:", error);
+    return [];
+  }
+}
+
+async function addToConversationHistory(kv, phoneNumber, userMessage, aiResponse, ttlDays = 7) {
+  try {
+    const history = await getConversationHistory(kv, phoneNumber);
+    
+    history.push({
+      timestamp: Date.now(),
+      userMessage: userMessage,
+      aiResponse: aiResponse
+    });
+
+    // Keep only the last maxHistory conversations
+    const maxHistory = 10;
+    if (history.length > maxHistory) {
+      history.splice(0, history.length - maxHistory);
+    }
+
+    // Store with TTL (7 days default)
+    await kv.put(phoneNumber, JSON.stringify(history), {
+      expirationTtl: 60 * 60 * 24 * ttlDays
+    });
+
+    return true;
+  } catch (error) {
+    console.error("Error storing conversation history:", error);
+    return false;
+  }
+}
+
+function buildConversationContext(history, maxContextLength = 1000) {
+  if (!history || history.length === 0) return "";
+  
+  const context = history
+    .map(entry => `User: ${entry.userMessage}\nAssistant: ${entry.aiResponse}`)
+    .join("\n\n");
+  
+  // Truncate if too long to avoid hitting API limits
+  return context.length > maxContextLength 
+    ? context.slice(-maxContextLength) + "\n\n[Previous conversation context included]"
+    : context;
+}
+
 // Gemini response helpers
 function extractGeminiText(data) {
   try {
@@ -66,7 +118,6 @@ function extractGeminiBlockReason(data) {
   return typeof reason === "string" ? reason : "";
 }
 
-// TODO: add user conversation history
 export default {
   async fetch(request, env) {
     if (request.method !== "POST") {
@@ -130,17 +181,30 @@ export default {
         });
       }
 
+      // Get conversation history for context
+      let conversationContext = "";
+      if (env.CONVERSATIONS) {
+        const history = await getConversationHistory(env.CONVERSATIONS, fromNumber);
+        conversationContext = buildConversationContext(history);
+        console.log(`Retrieved ${history.length} previous conversations for ${fromNumber}`);
+      }
+
       // Call Gemini API with a defensive timeout (Twilio requires a quick response)
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s
 
       let answer = "Sorry, I couldn't get a response.";
       try {
+        // Build the request with conversation context if available
         const requestBody = {
           contents: [
             {
               role: "user",
-              parts: [{ text: userMsg }],
+              parts: [{ 
+                text: conversationContext 
+                  ? `Previous conversation:\n${conversationContext}\n\nCurrent message: ${userMsg}`
+                  : userMsg 
+              }],
             },
           ],
           systemInstruction: {
@@ -190,6 +254,12 @@ export default {
       } catch (err) {
         console.error("Gemini API request failed:", err);
         clearTimeout(timeoutId);
+      }
+
+      // Store conversation in KV if available
+      if (env.CONVERSATIONS) {
+        await addToConversationHistory(env.CONVERSATIONS, fromNumber, userMsg, answer);
+        console.log(`Stored conversation for ${fromNumber}`);
       }
 
       // Optional: keep SMS concise to avoid very long segments

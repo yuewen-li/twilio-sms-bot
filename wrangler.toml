@@ -1,3 +1,7 @@
 name = "twilio-sms-bot"
 main = "src/index.js"
 compatibility_date = "2025-08-10"
+
+[[kv_namespaces]]
+binding = "CONVERSATIONS"
+id = "3f34579b36584dc7800e2b5d03914ecc"
