@@ -1,8 +1,9 @@
-// Minimal in-memory rate limiter (per Worker instance)
 const rateLimitStore = new Map();
 const RATE_LIMIT_CAPACITY = 5; // tokens
 const RATE_LIMIT_REFILL_WINDOW_MS = 60_000; // full refill per minute
 const RATE_LIMIT_REFILL_RATE_PER_MS = RATE_LIMIT_CAPACITY / RATE_LIMIT_REFILL_WINDOW_MS; // tokens per ms
+// global variables
+const GEMINI_MODEL = "gemini-2.5-flash-lite";
 
 function checkAndConsumeRateLimit(identifier) {
   if (!identifier) return true; // if unknown, don't block
@@ -99,6 +100,65 @@ function buildConversationContext(history, maxContextLength = 1000) {
     : context;
 }
 
+// Tool schema definition
+const tools = [
+  {
+    functionDeclarations: [
+      {
+        name: "web_search",
+        description: "Search the web for real-time information",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Search query"
+            }
+          },
+          required: ["query"]
+        }
+      }
+    ]
+  }
+];
+
+async function webSearchGoogle(query, env, { num = 3} = {}) {
+  if (!env.GOOGLE_API_KEY || !env.CUSTOM_SEARCH_ENGINE_ID) {
+    return { items: [], error: "Missing GOOGLE_API_KEY or CUSTOM_SEARCH_ENGINE_ID" };
+  }
+  try {
+    const url = `https://www.googleapis.com/customsearch/v1?key=${env.GOOGLE_API_KEY}&cx=${env.CUSTOM_SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=${num}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      console.error("CSE API error:", resp.statusText);
+      return [];
+    }
+    const data = await resp.json();
+    const items = Array.isArray(data?.items)
+      ? data.items.slice(0, num).map((it) => ({
+          title: String(it.title || "").trim(),
+          link: String(it.link || "").trim(),
+          snippet: String(it.snippet || it.title || "").trim(),
+        }))
+      : [];
+    console.log("Search results:", items);
+    return items;
+  } catch (err) {
+    console.error("Error during web search:", err);
+    return [];
+  }
+}
+
+function formatSearchResultsForPrompt(items) {
+  if (!items || items.length === 0) return "";
+  return items
+    .map((it, idx) => {
+      const n = idx + 1;
+      return `[${n}] ${it.title}\n${it.snippet}`;
+    })
+    .join("\n\n");
+}
+
 // Gemini response helpers
 function extractGeminiText(data) {
   try {
@@ -116,6 +176,29 @@ function extractGeminiText(data) {
 function extractGeminiBlockReason(data) {
   const reason = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason;
   return typeof reason === "string" ? reason : "";
+}
+
+async function geminiAPICall(requestBody, env) {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${env.GOOGLE_API_KEY}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    }
+  );
+  if (!response.ok) {
+    console.error("Gemini API non-OK status:", response.status, response.statusText);
+  } else {
+    const data = await response.json().catch((err) => {
+      console.error("Gemini JSON parse error:", err);
+      return null;
+    });
+    console.log("Gemini API Response:", data);
+    return data;
+}
 }
 
 export default {
@@ -143,9 +226,7 @@ export default {
       const fromNumber = (formData.get("From") || "").toString();
 
       // Whitelist enforcement (comma/newline/space-separated list)
-      const allowedList = parseWhitelist(
-        env.ALLOWED_FROM_NUMBERS || ""
-      );
+      const allowedList = parseWhitelist(env.ALLOWED_FROM_NUMBERS || "");
       if (!isAllowedFromNumber(fromNumber, allowedList)) {
         console.warn("Blocked non-whitelisted number:", fromNumber);
         return new Response("Forbidden", { status: 403 });
@@ -154,9 +235,7 @@ export default {
       // Minimal rate limiting keyed by sender phone number
       const allowed = checkAndConsumeRateLimit(fromNumber || "");
       if (!allowed) {
-        const twiml = buildTwiml(
-          "You're sending too many messages. Please try again later."
-        );
+        const twiml = buildTwiml("You're sending too many messages. Please try again later.");
         return new Response(twiml, {
           status: 200,
           headers: { "Content-Type": "application/xml" },
@@ -172,9 +251,7 @@ export default {
       }
 
       if (!env.GOOGLE_API_KEY) {
-        const twiml = buildTwiml(
-          "Server is missing authentication."
-        );
+        const twiml = buildTwiml("Server is missing authentication.");
         return new Response(twiml, {
           status: 200,
           headers: { "Content-Type": "application/xml" },
@@ -189,13 +266,9 @@ export default {
         console.log(`Retrieved ${history.length} previous conversations for ${fromNumber}`);
       }
 
-      // Call Gemini API with a defensive timeout (Twilio requires a quick response)
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s
-
       let answer = "Sorry, I couldn't get a response.";
       try {
-        // Build the request with conversation context if available
+        const systemPrompt = "You are a helpful assistant for old people, answer their questions in a way that is easy to understand and succinct. Use the tools provided if necessary. Keep your responses within 160 characters.";
         const requestBody = {
           contents: [
             {
@@ -209,52 +282,51 @@ export default {
           ],
           systemInstruction: {
             role: "system",
-            parts: [{ text: "You are a helpful assistant for old people, answer their questions in a way that is easy to understand and succinct. Keep your responses within 160 characters." }],
+            parts: [{ text: systemPrompt }],
           },
+          tools: tools
         };
 
-        const aiResp = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${env.GOOGLE_API_KEY}`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(requestBody),
-            signal: controller.signal,
-          }
-        );
-
-        clearTimeout(timeoutId);
-
-        if (!aiResp.ok) {
-          console.error(
-            "Gemini API non-OK status:",
-            aiResp.status,
-            aiResp.statusText
-          );
+        const response = await geminiAPICall(requestBody, env);
+        const toolCalls = response?.candidates?.[0]?.content?.parts?.filter(p => p.functionCall);
+        let text = "";
+        let formattedResults = "";
+        if (toolCalls?.length > 0) {
+          // Execute tools
+          for (const toolCall of toolCalls) {
+            if (toolCall.functionCall.name === "web_search") {
+              console.log("Executing web search tool call:", toolCall.functionCall);
+              const args = toolCall.functionCall.args;
+              const results = await webSearchGoogle(args.query, env);
+              formattedResults += formatSearchResultsForPrompt(results);
+            }
+          } 
+          const finalPrompt = `Web search results:\n${formattedResults}\n\nUse these sources to answer the question concisely.\n\nUser question: ${userMsg}`;
+          const finalRequestBody = {
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: finalPrompt }],
+              },
+            ],
+          };
+          const finalResponse = await geminiAPICall(finalRequestBody, env);
+          text = extractGeminiText(finalResponse);
         } else {
-          const data = await aiResp.json().catch((err) => {
-            console.error("Gemini JSON parse error:", err);
-            return null;
-          });
-          console.log("Gemini API Response:", data);
-
-          const text = extractGeminiText(data);
-          console.log("Gemini API text:", text);
-          if (text) {
-            answer = text;
-          } else {
-            const reason = extractGeminiBlockReason(data);
-            answer = reason
-              ? `No text generated (reason: ${reason}).`
-              : "Sorry, I couldn't get a response.";
-          }
+            text = extractGeminiText(response);
         }
-      } catch (err) {
-        console.error("Gemini API request failed:", err);
-        clearTimeout(timeoutId);
+        
+        if (text) {
+          answer = text;
+          console.log("Twilio answer:", answer);
+        } else {
+          const reason = extractGeminiBlockReason(response);
+          answer = reason ? `No text generated (reason: ${reason}).` : "Sorry, I couldn't get a response.";
+        }
       }
+     catch (err) {
+      console.error("Gemini API request failed:", err);
+    }
 
       // Store conversation in KV if available
       if (env.CONVERSATIONS) {
@@ -263,7 +335,7 @@ export default {
       }
 
       // Optional: keep SMS concise to avoid very long segments
-      const MAX_LEN = 1200;
+      const MAX_LEN = 160;
       if (answer.length > MAX_LEN) {
         answer = answer.slice(0, MAX_LEN - 3) + "...";
       }
