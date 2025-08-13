@@ -318,7 +318,6 @@ export default {
         
         if (text) {
           answer = text;
-          console.log("Twilio answer:", answer);
         } else {
           const reason = extractGeminiBlockReason(response);
           answer = reason ? `No text generated (reason: ${reason}).` : "Sorry, I couldn't get a response.";
