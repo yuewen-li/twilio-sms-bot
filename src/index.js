@@ -112,7 +112,7 @@ const tools = [
           properties: {
             query: {
               type: "string",
-              description: "Search query"
+              description: "Search query on browser"
             }
           },
           required: ["query"]
@@ -122,12 +122,12 @@ const tools = [
   }
 ];
 
-async function webSearchGoogle(query, env, { num = 3} = {}) {
-  if (!env.GOOGLE_API_KEY || !env.CUSTOM_SEARCH_ENGINE_ID) {
-    return { items: [], error: "Missing GOOGLE_API_KEY or CUSTOM_SEARCH_ENGINE_ID" };
+async function webSearchGoogle(query, env, {num = 1} = {}) {
+  if (!env.CUSTOM_SEARCH_API_KEY || !env.CUSTOM_SEARCH_ENGINE_ID) {
+    return { items: [], error: "Missing CUSTOM_SEARCH_API_KEY or CUSTOM_SEARCH_ENGINE_ID" };
   }
   try {
-    const url = `https://www.googleapis.com/customsearch/v1?key=${env.GOOGLE_API_KEY}&cx=${env.CUSTOM_SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=${num}`;
+    const url = `https://www.googleapis.com/customsearch/v1?key=${env.CUSTOM_SEARCH_API_KEY}&cx=${env.CUSTOM_SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=${num}`;
     const resp = await fetch(url);
     if (!resp.ok) {
       console.error("CSE API error:", resp.statusText);
@@ -268,7 +268,7 @@ export default {
 
       let answer = "Sorry, I couldn't get a response.";
       try {
-        const systemPrompt = "You are a helpful assistant for old people, answer their questions in a way that is easy to understand and succinct. Use the tools provided if necessary. Keep your responses within 160 characters.";
+        const systemPrompt = "You are a helpful assistant for old people who don't know how to use the internet, answer their questions in a way that is easy to understand and succinct. If the user's question requires up-to-date information or a web search, always call the web_search tool. Keep your responses within 160 characters.";
         const requestBody = {
           contents: [
             {
